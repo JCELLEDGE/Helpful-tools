@@ -47,12 +47,14 @@ struct Profile {
   uint16_t    port;
 };
 
-Profile gProfiles[] = {
-  { "Office PC",       "MySSID", "MyPassword", "192.168.1.10", 5005 },
-  { "Laptop",    "MySSID",        "MyPassword",  "192.168.10.10", 5005 },
-  { "Mac Studio",    "MySSID",        "MyPassword",     "192.168.5.10",  5005 },
-  { "Desktop", "MySSID",        "MyPassword",  "192.168.20.10",  5005 },
+Profile profiles[] = {
+  { "Desktop", "SSID Name", "Password", "192.168.1.100", "5005" }, //Change each Profile to match your computers running ProPresenter. Add or Remove as needed.
+  { "Laptop", "SSID Name", "Password", "192.168.1.200", "5005" },
+  { "Mac Studio", "SSID Name", "Password", "192.168.10.100",   "5005" },
+  { "Mac Mini", "SSID Name", "Password", "192.168.10.200",  "5005" }
+  { "Youth", "SSID Name", "Password", "192.168.2.100", "5005" },
 };
+
 static const int NUM_PROFILES = sizeof(gProfiles) / sizeof(gProfiles[0]);
 
 int   gSelectedProfile = 0;
@@ -85,11 +87,11 @@ enum CmdType : uint8_t {
   CMD_NET_UP,
   CMD_HOME0,
   CMD_CLEAR_SLIDE,
-  CMD_CLEAR_TEXT,
+  CMD_CLEAR_ALL,
   CMD_NEXT_FOCUS,
-  CMD_PREV_FOCUS,
-  CMD_CLEAR_ALL
+  CMD_PREV_FOCUS
 };
+
 
 struct CmdMsg { CmdType type; };
 // Forward declarations for functions defined later
@@ -300,8 +302,13 @@ bool proReachable() {
   return (WiFi.status() == WL_CONNECTED && !gProUnreachable);
 }
 
+// ============================ STATUS BAR ============================
 // ============================================================
 // UI SECTION — STATUS BAR + SLIDE NUMBER BOX + UI_SLIDE HANDLER
+// ============================================================
+
+// ============================================================
+// STATUS BAR — MiniJoyC‑style, corrected alignment
 // ============================================================
 void drawStatusBar(bool heartbeatOn) {
     int barH = STATUS_H;
@@ -379,8 +386,10 @@ void drawStatusBar(bool heartbeatOn) {
     }
 }
 
+
+
 // ============================================================
-// SLIDE NUMBER BAR — UI‑driven flash
+// SLIDE NUMBER BAR — UI‑driven flash, no gCmdFlashUntil
 // ============================================================
 void drawSlideNumberBar(int idx1, uint16_t bg, uint16_t fg) {
     if (idx1 <= 0) return;
@@ -443,13 +452,13 @@ void drawSlideNumberBar(int idx1, uint16_t bg, uint16_t fg) {
 void handleUiSlide(int slideIndex) {
 
     // ---------------------------------------------------------
-    // Draw status bar FIRST
+    // FIX #1 — Draw status bar FIRST
     // (prevents overwriting the slide number border)
     // ---------------------------------------------------------
     drawStatusBar((millis() / 500) % 2 == 0);
 
     // ---------------------------------------------------------
-    // Draw slide number box LAST
+    // FIX #3 — Draw slide number box LAST
     // (ensures flash border is always visible)
     // ---------------------------------------------------------
     drawSlideNumberBar(slideIndex, COL_BG, COL_TEXT);
@@ -629,6 +638,7 @@ void uiTask(void*) {
 
     // ---------------------------------------------------------
     // Command flash window → keep redrawing slide number bar
+    // (MiniJoyC-style behavior)
     // ---------------------------------------------------------
     bool flashActive = (millis() < gCmdFlashUntil);
 
@@ -644,8 +654,8 @@ void uiTask(void*) {
 
     lastFlashActive = flashActive;
 
-  }
-} 
+  }   // closes for(;;)
+}     // closes uiTask()
 
 // ============================================================
 // SECTION 4 OF 6
@@ -986,6 +996,7 @@ void httpTask(void*) {
                         triggerFlash(ok);
                     }
                 } break;
+
                 // ---------------------------------------------------------
                 // NEXT FOCUS
                 // ---------------------------------------------------------
@@ -1276,20 +1287,21 @@ void loop() {
   debugJoystickOnChange(); // optional
 
   // ================= FRONT BUTTONS =================
-  if (btnAction.isClick()) {
-    enqueueStatus("CLICK CLEAR ALL");
+if (btnAction.isClick()) {
+    enqueueStatus("CLEAR ALL…");
     CmdMsg c{ CMD_CLEAR_ALL };
     xQueueSend(cmdQ, &c, 0);
-  }
-  if (btnM5.isClick()) {
-    enqueueStatus("CLICK NEXT");
+}
+
+if (btnM5.isClick()) {
+    enqueueStatus("NEXT…");
     CmdMsg c{ CMD_NEXT };
     xQueueSend(cmdQ, &c, 0);
-  }
+}
 
-  if (M5.BtnPWR.wasPressed()) {
+if (M5.BtnPWR.wasPressed()) {
     // reserved for future use
-  }
+}
 
   // ================= NETWORK KEEPALIVE =================
   static uint32_t lastNetKick = 0;
