@@ -48,7 +48,7 @@ struct Profile {
 };
 
 Profile gProfiles[] = {
-  { "Home PC",       "TMobile-8EAA", "171217121712", "192.168.12.137", 5005 },
+  { "Office PC",       "TMobile-8EAA", "MhPassword", "192.168.1.10", 5005 },
   { "Laptop",    "MySSID",        "MyPassword",  "192.168.10.10", 5005 },
   { "Mac Studio",    "MySSID",        "MyPassword",     "192.168.5.10",  5005 },
   { "Desktop", "MySSID",        "MyPassword",  "192.168.20.10",  5005 },
