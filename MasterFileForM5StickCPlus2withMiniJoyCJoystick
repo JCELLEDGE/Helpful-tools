@@ -1,0 +1,1801 @@
+// ============================================================
+// SECTION 1 OF 5
+// HEADERS, GLOBALS, ORIENTATION SELECTOR (SCALABLE PROFILES)
+// ============================================================
+
+#include <M5StickCPlus2.h>
+#include <M5GFX.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <UNIT_MiniJoyC.h>
+#include <vector>
+#include <Wire.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#ifndef JoyC_ADDR
+#define JoyC_ADDR 0x52
+#endif
+
+UNIT_JOYC joyc;
+
+int selectedProfile = 0;
+int selectedOrientation = 0;
+
+bool DEBUG = false;   // master debug switch
+//DEBUG = true;   // during development
+//DEBUG = false;  // for production
+
+void uiTask(void*);
+void httpTask(void*);
+void statusTask(void*);
+void initLayoutPortrait();
+void initLayoutLandscapeA1();
+void initLayoutAndSprites();
+void showNetworkInfoPage();
+
+// --- forward declarations for helpers used later ---
+bool ensureWiFi();
+bool pollSlideOnce(String& err);
+static bool gBgActive = false;
+
+char wifiSSID[32];
+char wifiPassword[64];
+String pro7NetworkAddress;
+String pro7NetworkPort;
+
+struct JoyState {
+  int8_t x;
+  int8_t y;
+  int8_t btn;
+};
+
+enum StateMsgType {
+    STATE_SLIDE_INDEX,
+    STATE_SLIDE_NAME,
+    STATE_SLIDE_UUID,
+    STATE_PRO_ONLINE,
+    STATE_PRO_OFFLINE
+};
+
+struct StateMsg {
+    StateMsgType type;
+    int index;        // for slide index
+    String text;      // for name or uuid
+};
+
+enum CmdType : uint8_t {
+  CMD_POLL,
+  CMD_NEXT,
+  CMD_PREV,
+  CMD_NET_UP,
+  CMD_HOME0,
+  CMD_CLEAR_SLIDE,
+  CMD_CLEAR_TEXT,
+  CMD_NEXT_FOCUS,
+  CMD_PREV_FOCUS,
+  CMD_CLEAR_ALL
+};
+// ============================================================
+// API COMMAND STRUCT
+// ============================================================
+struct ApiCommand {
+    CmdType type;
+    const char* url;
+    const char* labelOK;
+    const char* labelERR;
+};
+// ============================================================
+// API TABLE
+// ============================================================
+static const ApiCommand apiTable[] = {
+    { CMD_NEXT,        "/v1/trigger/next",                     "NEXT OK", "NEXT ERR" },
+    { CMD_PREV,        "/v1/trigger/previous",                 "PREV OK", "PREV ERR" },
+    { CMD_HOME0,       "/v1/presentation/active/trigger",      "HOME OK", "HOME ERR" },
+    { CMD_CLEAR_SLIDE, "/v1/clear/layer/slide",                "CLR S OK","CLR S ERR" },
+    { CMD_CLEAR_TEXT,  "/v1/clear/layer/media",                "CLR T OK","CLR T ERR" },
+    { CMD_NEXT_FOCUS,  "/v1/playlist/focused/next/trigger",    "FOCUS→",  "FOCUS ERR" },
+    { CMD_PREV_FOCUS,  "/v1/playlist/focused/previous/trigger","FOCUS←",  "FOCUS ERR" },
+    { CMD_CLEAR_ALL,   "/v1/clear/group/Clear%20All/trigger",  "CLR ALL", "CLR ALL ERR" }
+};
+
+struct CmdMsg { CmdType type; };
+
+enum UiType : uint8_t { UI_STATUS, UI_SLIDE, UI_WIFI, UI_THUMB };
+JoyState readJoystickMiniJoyC() {
+  JoyState js{0, 0, 0};
+
+  // Raw MiniJoyC values
+  js.x   = joyc.getPOSValue(0, _8bit);   // X axis
+  js.y   = joyc.getPOSValue(1, _8bit);   // Y axis
+  js.btn = joyc.getButtonStatus() ? 0 : 1;
+
+  if (selectedOrientation == 0) {
+    // ---------------------------------------------------------
+    // PORTRAIT — rotate 90° CCW (your current working behavior)
+    // x' =  y
+    // y' = -x
+    // ---------------------------------------------------------
+    int oldX = js.x;
+    int oldY = js.y;
+    js.x =  oldY;     // vertical (UP/DOWN)
+    js.y = -oldX;     // horizontal (LEFT/RIGHT)
+  }
+  else {
+    // ---------------------------------------------------------
+    // LANDSCAPE — rotate 90° CW + fix inversion
+    // x' =  y
+    // y' = -x
+    //
+    // This matches your Portrait transform but applied
+    // to the joystick's physical orientation in Landscape.
+    // ---------------------------------------------------------
+    int oldX = js.x;
+    int oldY = js.y;
+    js.x =  oldY;     // vertical (UP/DOWN)
+    js.y = -oldX;     // horizontal (LEFT/RIGHT)
+  }
+
+  return js;
+}
+// ============================================================
+// LOOKUP FUNCTION
+// ============================================================
+const ApiCommand* findApi(CmdType t) {
+    for (size_t i = 0; i < sizeof(apiTable) / sizeof(apiTable[0]); i++) {
+        if (apiTable[i].type == t) {
+            return &apiTable[i];
+        }
+    }
+    return nullptr;
+}
+
+struct UiMsg {
+  UiType type;
+  char text[64];
+  int  slideIndexOneBased;
+  char presName[64];
+};
+
+static QueueHandle_t cmdQ;
+static QueueHandle_t uiQ;
+static SemaphoreHandle_t xMutex;
+static SemaphoreHandle_t gThumbMutex;
+static volatile uint32_t millisTime = 0;
+
+static bool gWifiOK      = false;
+static bool gProOK       = false;
+static bool gTextCleared = false;
+static int  gSlideIndex  = 0;
+static String gStatusText;
+static bool gNetworkInfoDismissed = false;
+
+M5Canvas sprCard(&M5.Display);
+M5Canvas sprTitle(&M5.Display);
+
+static int LCD_W = 0, LCD_H = 0;
+static int PAD   = 8;
+static int STATUS_H = 20;
+static const int STATUS2_H = 16;   // height of middle status bar
+static int TITLE_H  = 18;
+static int TITLE_Y  = 0;
+static int CARD_Y   = 0;
+static int CARD_H   = 0;
+
+#define COL_BG     TFT_BLACK
+#define COL_TEXT   TFT_WHITE
+#define COL_MUTED  0x8410
+#define COL_BORDER 0xDEFB
+#define COL_GOOD   TFT_GREEN
+#define COL_BAD    TFT_RED
+
+static uint32_t gCmdFlashUntil = 0;
+static uint16_t gCmdFlashColor = COL_MUTED;
+
+struct Marquee {
+  String   text;
+  int      x = 0;
+  int      w = 0;
+  bool     needed = true;
+  uint32_t lastTick = 0;
+  uint32_t pauseStart = 0;
+  bool     inPause = false;
+};
+
+Marquee gMarq;
+
+struct TransportState {
+  bool isPlaying = false;
+  String name = "";
+};
+
+static TransportState gTransport;
+
+static const int SCROLL_STEP_PX   = 1;
+static const int SCROLL_DELAY_MS  = 30;
+static const int SCROLL_SPACER    = 40;
+static const int SCROLL_PAUSE_MS  = 500;
+
+static std::vector<uint8_t> gThumbBuf;
+
+static const TickType_t kPollIntervalTicks   = pdMS_TO_TICKS(500);
+static const TickType_t kAfterTriggerDelay   = pdMS_TO_TICKS(50);
+static const TickType_t kHttpRetryDelayTicks = pdMS_TO_TICKS(150);
+
+bool gOnInfoPage = false;
+
+// ============================================================
+// SCALABLE PROFILES
+// ============================================================
+struct Profile {
+  const char* name;
+  const char* ssid;
+  const char* password;
+  const char* ip;
+  const char* port;
+};
+
+Profile profiles[] = {
+  { "Desktop", "SSID Name", "Password", "192.168.1.100", "5005" }, //Change each Profile to match your computers running ProPresenter. Add or Remove as needed.
+  { "Laptop", "SSID Name", "Password", "192.168.1.200", "5005" },
+  { "Mac Studio", "SSID Name", "Password", "192.168.10.100",   "5005" },
+  { "Mac Mini", "SSID Name", "Password", "192.168.10.200",  "5005" }
+  { "Youth", "SSID Name", "Password", "192.168.2.100", "5005" },
+};
+
+// ============================================================
+// ORIENTATION SELECTOR
+// ============================================================
+void runOrientationMenu() {
+  M5.Lcd.fillScreen(COL_BG);
+  M5.Lcd.setTextFont(2);
+  M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+
+  const char* options[2] = { "Portrait", "Landscape" };
+  int highlight = 0;
+  int lastHighlight = -1;
+
+  auto drawMenu = [&](int hl) {
+    M5.Lcd.fillScreen(COL_BG);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Select Orientation:");
+    for (int i = 0; i < 2; i++) {
+      M5.Lcd.setTextColor(i == hl ? TFT_BLACK : TFT_WHITE,
+                          i == hl ? TFT_WHITE : COL_BG);
+      M5.Lcd.setCursor(20, 40 + i * 25);
+      M5.Lcd.println(options[i]);
+    }
+  };
+
+  drawMenu(highlight);
+  lastHighlight = highlight;
+
+  while (true) {
+    M5.update();
+    JoyState js = readJoystickMiniJoyC();
+    if (js.y > 20) { highlight = (highlight + 1) % 2; delay(150); }
+    if (js.y < -20){ highlight = (highlight + 1) % 2; delay(150); }
+    if (highlight != lastHighlight) {
+      drawMenu(highlight);
+      lastHighlight = highlight;
+    }
+    if (js.btn == 1 || M5.BtnA.wasPressed()) {
+      selectedOrientation = highlight;
+      break;
+    }
+    delay(10);
+  }
+
+  M5.Lcd.setRotation(selectedOrientation == 0 ? 0 : 1);
+  M5.Lcd.fillScreen(COL_BG);
+  delay(50);
+}
+// ============================================================
+// SECTION 2 OF 5
+// PROFILE SELECTOR + PORTRAIT LAYOUT
+// ============================================================
+void runStartupMenu() {
+  M5.Lcd.fillScreen(COL_BG);
+  M5.Lcd.setTextFont(2);
+  M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+
+  int profileCount = sizeof(profiles) / sizeof(Profile);
+  int highlight = 0;
+  int lastHighlight = -1;
+
+  auto drawMenu = [&](int hl) {
+    M5.Lcd.fillScreen(COL_BG);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.println("Select Profile:");
+
+    for (int i = 0; i < profileCount; i++) {
+      M5.Lcd.setTextColor(
+        (i == hl) ? TFT_BLACK : TFT_WHITE,
+        (i == hl) ? TFT_WHITE : COL_BG
+      );
+
+      M5.Lcd.setCursor(20, 40 + i * 25);
+      M5.Lcd.printf("%d) %s", i + 1, profiles[i].name);
+    }
+  };
+
+  drawMenu(highlight);
+  lastHighlight = highlight;
+
+  while (true) {
+    M5.update();
+    JoyState js = readJoystickMiniJoyC();
+
+    if (js.y > 20) {
+      highlight--;
+      if (highlight < 0) highlight = profileCount - 1;
+      delay(150);
+    }
+    if (js.y < -20) {
+      highlight++;
+      if (highlight >= profileCount) highlight = 0;
+      delay(150);
+    }
+
+    if (highlight != lastHighlight) {
+      drawMenu(highlight);
+      lastHighlight = highlight;
+    }
+
+    if (js.btn == 1 || M5.BtnA.wasPressed()) {
+      selectedProfile = highlight;
+      break;
+    }
+
+    delay(10);
+  }
+
+  strncpy(wifiSSID, profiles[selectedProfile].ssid, sizeof(wifiSSID) - 1);
+  wifiSSID[sizeof(wifiSSID) - 1] = '\0';
+
+  strncpy(wifiPassword, profiles[selectedProfile].password, sizeof(wifiPassword) - 1);
+  wifiPassword[sizeof(wifiPassword) - 1] = '\0';
+
+  pro7NetworkAddress = profiles[selectedProfile].ip;
+  pro7NetworkPort    = profiles[selectedProfile].port;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID, wifiPassword);
+
+  showNetworkInfoPage();
+  gOnInfoPage = true;
+}
+// ============================================================
+// LAYOUT CONSTANTS
+// ============================================================
+static const int SLIDE_NUM_H = 64;   // enough for font 6 + padding
+
+// ============================================================
+// PORTRAIT LAYOUT (Corrected)
+// ============================================================
+void initLayoutPortrait() {
+  LCD_W = M5.Display.width();
+  LCD_H = M5.Display.height();
+
+  PAD       = 6;
+  STATUS_H  = 22;
+  TITLE_H   = 20;
+
+  TITLE_Y = 0;
+  CARD_Y  = TITLE_H + PAD;
+
+  // Reserve space for slide number bar
+  CARD_H = LCD_H - CARD_Y - STATUS_H - SLIDE_NUM_H - PAD;
+  if (CARD_H < 60) CARD_H = 60;
+
+  sprCard.deleteSprite();
+  sprTitle.deleteSprite();
+
+  sprCard.setColorDepth(16);
+  sprCard.createSprite(LCD_W - PAD * 2, CARD_H);
+
+  sprTitle.setColorDepth(8);
+  sprTitle.createSprite(LCD_W, TITLE_H);
+  sprTitle.setTextWrap(false);
+  sprTitle.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// LANDSCAPE LAYOUT
+// ============================================================
+void initLayoutLandscapeA1() {
+  LCD_W = M5.Display.width();
+  LCD_H = M5.Display.height();
+
+  PAD       = 6;
+  TITLE_H   = 16;   // was 14
+  STATUS_H  = 18;   // was 16
+  const int SLIDE_NUM_H = 48;   // was 32
+
+  TITLE_Y = 0;
+
+  CARD_Y  = TITLE_Y + TITLE_H + PAD;
+
+  // Much taller card area now
+  CARD_H = LCD_H - CARD_Y - STATUS_H - SLIDE_NUM_H - PAD;
+  if (CARD_H < 80) CARD_H = 80;
+
+  sprCard.deleteSprite();
+  sprTitle.deleteSprite();
+
+  // Keep your existing width logic
+  const int THUMB_SHIFT_LEFT = 60;
+  int cardW = (LCD_W - PAD * 2) - THUMB_SHIFT_LEFT;
+
+  sprCard.setColorDepth(16);
+  sprCard.createSprite(cardW, CARD_H);
+
+  sprTitle.setColorDepth(8);
+  sprTitle.createSprite(LCD_W, TITLE_H);
+  sprTitle.setTextWrap(false);
+  sprTitle.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// LAYOUT DISPATCHER
+// ============================================================
+void initLayoutAndSprites() {
+  if (selectedOrientation == 0) {
+    initLayoutPortrait();
+  } else {
+    initLayoutLandscapeA1();
+  }
+}
+
+// ============================================================
+// SECTION 3 OF 5
+// HTTP, THUMBNAIL, MARQUEE, STATUS BAR, SLIDE NUMBER BAR
+// ============================================================
+
+String baseUrl() {
+  return "http://" + pro7NetworkAddress + ":" + pro7NetworkPort;
+}
+
+bool httpGET_once(const String& url, int& code, String& body) {
+  WiFiClient client;
+  client.setNoDelay(true);
+  client.setTimeout(3000);
+
+  HTTPClient http;
+  http.useHTTP10(true);
+
+  if (!http.begin(client, url)) {
+    code = -1000;
+    return false;
+  }
+
+  http.addHeader("Connection", "close");
+  http.setTimeout(3000);
+
+  code = http.GET();
+  if (code > 0) {
+    body = http.getString();
+    gWifiOK = true;
+  }
+  http.end();
+  return code > 0;
+}
+
+bool fetchThumbnailBytes(const String& uuid, int slideIndex, int slideIndexOneBased) {
+  String url = baseUrl() + "/v1/presentation/" + uuid +
+               "/thumbnail/" + String(slideIndex) +
+               "?quality=136&thumbnail_type=jpeg";
+
+  WiFiClient client;
+  client.setNoDelay(true);
+  client.setTimeout(3000);
+
+  HTTPClient http;
+  http.useHTTP10(true);
+
+  if (!http.begin(client, url)) return false;
+
+  http.addHeader("Connection", "close");
+  http.setTimeout(3000);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  int len = http.getSize();
+
+  if (gThumbMutex) xSemaphoreTake(gThumbMutex, portMAX_DELAY);
+  gThumbBuf.clear();
+
+  WiFiClient* stream = http.getStreamPtr();
+
+  if (len > 0) {
+    gThumbBuf.resize(len);
+    int readTotal = 0;
+    while (readTotal < len) {
+      int n = stream->readBytes((char*)gThumbBuf.data() + readTotal, len - readTotal);
+      if (n <= 0) break;
+      readTotal += n;
+    }
+    if (readTotal != len) {
+      http.end();
+      if (gThumbMutex) xSemaphoreGive(gThumbMutex);
+      return false;
+    }
+  } else {
+    uint8_t buf[256];
+    while (http.connected()) {
+      int avail = stream->available();
+      if (avail <= 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
+      int n = stream->readBytes((char*)buf, min(avail, (int)sizeof(buf)));
+      if (n <= 0) break;
+      gThumbBuf.insert(gThumbBuf.end(), buf, buf + n);
+    }
+  }
+
+  http.end();
+  bool empty = gThumbBuf.empty();
+  if (gThumbMutex) xSemaphoreGive(gThumbMutex);
+
+  return !empty;
+}
+bool pollTransportPresentationCurrent() {
+  String url = baseUrl() + "/v1/transport/presentation/current?chunked=false";
+
+  int code = 0;
+  String payload;
+
+  if (!httpGET_once(url, code, payload)) {
+    gTransport.isPlaying = false;
+    gTransport.name = "";
+    return false;
+  }
+
+  if (code != HTTP_CODE_OK) {
+    gTransport.isPlaying = false;
+    gTransport.name = "";
+    return false;
+  }
+
+  StaticJsonDocument<1024> doc;
+  auto err = deserializeJson(doc, payload);
+  if (err) {
+    gTransport.isPlaying = false;
+    gTransport.name = "";
+    return false;
+  }
+
+  gTransport.isPlaying = doc["is_playing"] | false;
+  gTransport.name      = doc["name"]       | "";
+
+if (DEBUG) Serial.println("--- TRANSPORT POLL ---");
+if (DEBUG) Serial.print("is_playing: ");
+if (DEBUG) Serial.println(gTransport.isPlaying ? "true" : "false");
+if (DEBUG) Serial.print("name: ");
+if (DEBUG) Serial.println(gTransport.name);
+if (DEBUG) Serial.println("----------------------");
+
+  return true;
+}
+
+// ============================================================
+// STATUS BAR
+// ============================================================
+  void drawStatusBar(bool heartbeatOn) {
+  int barH = (selectedOrientation == 0) ? 22 : 18;
+
+  // Place status bar at the bottom
+  int barY = LCD_H - barH;
+
+  // Clear status bar area
+  M5.Display.fillRect(0, barY, LCD_W, barH, COL_BG);
+
+  // Divider line above the bar
+  M5.Display.drawLine(0, barY - 1, LCD_W, barY - 1, COL_BORDER);
+
+  // Font setup
+  M5.Display.setTextFont(1);
+  M5.Display.setTextColor(COL_TEXT, COL_BG);
+
+  // HEARTBEAT ICON (LEFT)
+  int hbX = 4;
+  int hbY = barY + 4;  // <-- relative to bar
+  uint16_t hbColor = heartbeatOn ? TFT_RED : 0xA000;
+  M5.Display.fillCircle(hbX, hbY + 4, 3, hbColor);
+
+  // PROFILE NAME (next to heartbeat)
+  const char* profName = profiles[selectedProfile].name;
+  M5.Display.setCursor(hbX + 12, hbY);
+  M5.Display.print(profName);
+
+// ---------------------------------------------------------
+// PROPRESENTER STATUS INDICATOR ("P" glyph)
+// ---------------------------------------------------------
+int pX = hbX + 12 + M5.Display.textWidth(profName) + 10;
+int pY = hbY;
+
+uint16_t pColor;
+if (gProOK)      pColor = COL_GOOD;   // green
+else if (!gWifiOK) pColor = COL_MUTED; // gray if Wi‑Fi down
+else             pColor = COL_BAD;    // red if ProPresenter unreachable
+
+M5.Display.setTextColor(pColor, COL_BG);
+M5.Display.setCursor(pX, pY);
+M5.Display.print("P");
+// ---------------------------------------------------------
+// BG TEXT BADGE ("BKG")
+// ---------------------------------------------------------
+int bkgX = pX + 14;   // position just after the "P"
+int bkgY = pY;
+
+uint16_t bkgColor;
+
+if (!gProOK) {
+    bkgColor = COL_MUTED;        // gray when ProPresenter unreachable
+} else if (gTransport.isPlaying) {
+    bkgColor = COL_GOOD;         // green when BG media active
+} else {
+    bkgColor = COL_BAD;          // red when no BG media
+}
+
+M5.Display.setTextFont(1);
+M5.Display.setTextColor(bkgColor, COL_BG);
+M5.Display.setCursor(bkgX, bkgY);
+M5.Display.print("BKG");
+
+
+  // WIFI SIGNAL BARS (RIGHT)
+  int barsX = LCD_W - 20;
+  int barsY = barY + 4;      // <-- relative to bar
+  int barW = 3;
+  int barGap = 2;
+
+  int strength = WiFi.RSSI();
+  int level = 0;
+  if (strength > -50) level = 3;
+  else if (strength > -70) level = 2;
+  else if (strength > -85) level = 1;
+
+  uint16_t barColor = gWifiOK ? COL_GOOD : COL_MUTED;
+
+  for (int i = 0; i < 3; i++) {
+    int h = 3 + i * 2;
+    int x = barsX + i * (barW + barGap);
+    int y = barsY + (6 - h);     // <-- also relative to bar
+    if (i < level) {
+      M5.Display.fillRect(x, y, barW, h, barColor);
+    } else {
+      M5.Display.drawRect(x, y, barW, h, COL_MUTED);
+    }
+  }
+}
+
+// ============================================================
+// MARQUEE TITLE
+// ============================================================
+void drawTitleMarqueeTick(uint16_t bg, uint16_t fg) {
+  sprTitle.fillSprite(bg);
+  sprTitle.fillRect(0, 0, LCD_W, 2, fg);
+
+  sprTitle.setTextColor(fg, bg);
+  sprTitle.setTextFont(2);
+
+  int lh = sprTitle.fontHeight();
+  int y0 = (TITLE_H - lh) / 2 + 3;
+  if (y0 < 0) y0 = 0;
+
+  if (!gMarq.needed) {
+    int centeredX = PAD + (LCD_W - 2 * PAD - gMarq.w) / 2;
+    if (centeredX < PAD) centeredX = PAD;
+    sprTitle.setCursor(centeredX, y0);
+    sprTitle.print(gMarq.text);
+    return;
+  }
+
+  static uint32_t lastTick = 0;
+  uint32_t now = millis();
+
+  if (now - lastTick >= SCROLL_DELAY_MS) {
+    lastTick = now;
+    gMarq.x -= SCROLL_STEP_PX;
+
+    int resetThreshold = -(gMarq.w + SCROLL_SPACER + LCD_W);
+    if (gMarq.x < resetThreshold) {
+      gMarq.x = 0;
+    }
+  }
+
+  int x1 = PAD + gMarq.x;
+  int x2 = x1 + gMarq.w + SCROLL_SPACER;
+
+  sprTitle.setCursor(x1, y0);
+  sprTitle.print(gMarq.text);
+
+  sprTitle.setCursor(x2, y0);
+  sprTitle.print(gMarq.text);
+}
+
+// ============================================================
+// NEW — SLIDE NUMBER BAR (ROUNDED RECTANGLE, FONT 6)
+// ============================================================
+void drawSlideNumberBar() {
+    if (gSlideIndex <= 0) return;
+
+    String s = String(gSlideIndex);
+
+    // ---------------------------------------------------------
+    // FONT SELECTION
+    // ---------------------------------------------------------
+    if (selectedOrientation == 0) {
+        M5.Lcd.setTextFont(6);   // PORTRAIT → big
+    } else {
+        M5.Lcd.setTextFont(4);   // LANDSCAPE → medium
+    }
+
+    int textW = M5.Lcd.textWidth(s);
+    int textH = M5.Lcd.fontHeight();
+
+    int padX = 10;
+    int padY = 4;
+
+    int boxW = textW + padX * 2;
+    int boxH = textH + padY * 2;
+
+    int boxX, boxY;
+
+    // ---------------------------------------------------------
+    // PORTRAIT MODE — centered horizontally, above status bar
+    // ---------------------------------------------------------
+    if (selectedOrientation == 0) {
+        boxX = (LCD_W - boxW) / 2;
+
+        // Corrected: only one status bar now
+        boxY = LCD_H - STATUS_H - boxH - 6;
+    }
+
+    // ---------------------------------------------------------
+    // LANDSCAPE MODE — centered vertically relative to thumbnail
+    // ---------------------------------------------------------
+    else {
+        boxX = LCD_W - boxW - 8;
+
+        int cardCenterY = CARD_Y + (CARD_H / 2);
+        boxY = cardCenterY - (boxH / 2);
+    }
+    // ---------------------------------------------------------
+    // ERASE BORDER AREA (prevents stuck border)
+    // ---------------------------------------------------------
+    M5.Lcd.fillRect(
+        boxX - 3,
+        boxY - 3,
+        boxW + 6,
+        boxH + 6,
+        COL_BG
+    );
+
+    // ---------------------------------------------------------
+    // DRAW BOX
+    // ---------------------------------------------------------
+    M5.Lcd.fillRoundRect(boxX, boxY, boxW, boxH, 6, COL_MUTED);
+
+    // Flash border if command feedback active
+    if (millis() < gCmdFlashUntil) {
+        M5.Lcd.drawRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 8, gCmdFlashColor);
+    }
+
+    // ---------------------------------------------------------
+    // DRAW TEXT
+    // ---------------------------------------------------------
+    int textX = boxX + (boxW - textW) / 2;
+    int textY = boxY + (boxH - textH) / 2;
+
+    M5.Lcd.setTextColor(TFT_BLACK, COL_MUTED);
+    M5.Lcd.setCursor(textX, textY);
+    M5.Lcd.print(s);
+}
+
+// ============================================================
+// UI QUEUE HELPERS
+// ============================================================
+void enqueueStatus(const char* s) {
+  UiMsg m{};
+  m.type = UI_STATUS;
+  strncpy(m.text, s, sizeof(m.text) - 1);
+  xQueueSend(uiQ, &m, 0);
+  gStatusText = s;
+}
+
+void enqueueWifi(const char* s) {
+  UiMsg m{};
+  m.type = UI_WIFI;
+  strncpy(m.text, s, sizeof(m.text) - 1);
+  xQueueSend(uiQ, &m, 0);
+  gStatusText = s;
+}
+
+void enqueueSlide(int idx1, const char* nm) {
+  UiMsg m{};
+  m.type               = UI_SLIDE;
+  m.slideIndexOneBased = idx1;
+  strncpy(m.presName, nm ? nm : "", sizeof(m.presName) - 1);
+  xQueueSend(uiQ, &m, 0);
+}
+
+void enqueueThumb(int idx1) {
+  UiMsg m{};
+  m.type               = UI_THUMB;
+  m.slideIndexOneBased = idx1;
+  xQueueSend(uiQ, &m, 0);
+}
+
+// ============================================================
+// WI-FI + POLL HELPERS (STUB IMPLEMENTATIONS)
+// NOTE: Replace pollSlideOnce with your full JSON logic.
+// ============================================================
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    gWifiOK = true;
+    return true;
+  }
+
+  gWifiOK = false;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID, wifiPassword);
+
+  uint32_t start = millis();
+  while (millis() - start < 5000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      gWifiOK = true;
+      return true;
+    }
+    delay(100);
+  }
+  return false;
+}
+
+//============================================================
+// POLL SLIDE INDEX
+// ============================================================
+bool pollSlideOnce(String& errMsg) {
+  String url = baseUrl() + "/v1/presentation/slide_index";
+
+  if (DEBUG) Serial.println("--- SLIDE INDEX POLL ---");
+  if (DEBUG) Serial.print("URL: ");
+  if (DEBUG) Serial.println(url);
+  if (DEBUG) Serial.print("WiFi IP: ");
+  if (DEBUG) Serial.println(WiFi.localIP());
+  if (DEBUG) Serial.println("------------------------");
+
+  int code = 0;
+  String payload;
+
+  if (!httpGET_once(url, code, payload)) {
+    errMsg = "Poll fail";
+    gProOK = false;
+    return false;
+  }
+
+  if (DEBUG) Serial.print("HTTP code: ");
+  if (DEBUG) Serial.println(code);
+
+  if (code != HTTP_CODE_OK) {
+    errMsg = "HTTP";
+    gProOK = false;
+    enqueueStatus("ReqFail");
+    return false;
+  }
+
+  StaticJsonDocument<2048> doc;
+  auto err = deserializeJson(doc, payload);
+  if (err) {
+    errMsg = "Bad JSON";
+    gProOK = false;
+    return false;
+  }
+
+  int idx1 = -1;
+  const char* name = "";
+  const char* uuidC = nullptr;
+
+  JsonObject pi = doc["presentation_index"];
+  if (!pi.isNull()) {
+    if (pi.containsKey("index")) idx1 = (int)pi["index"] + 1;
+    JsonObject pid = pi["presentation_id"];
+    if (!pid.isNull()) {
+      if (pid.containsKey("name")) name = pid["name"];
+      if (pid.containsKey("uuid")) uuidC = pid["uuid"];
+    }
+  }
+
+  String uuid = uuidC ? String(uuidC) : "";
+
+  if (DEBUG) Serial.print("Parsed idx1: ");
+  if (DEBUG) Serial.println(idx1);
+  if (DEBUG) Serial.print("Parsed name: ");
+  if (DEBUG) Serial.println(name);
+  if (DEBUG) Serial.print("Parsed uuid: ");
+  if (DEBUG) Serial.println(uuid);
+  if (DEBUG) Serial.println("------------------------");
+
+// Background media active?
+if (doc.containsKey("presentation_index") &&
+    doc["presentation_index"].containsKey("presentation_id") &&
+    doc["presentation_index"]["presentation_id"].containsKey("backgrounds")) {
+
+    JsonArray bgs = doc["presentation_index"]["presentation_id"]["backgrounds"];
+    gBgActive = (bgs.size() > 0);
+} else {
+    gBgActive = false;
+}
+
+  // Treat -1 as "no active slide", not an error
+  if (idx1 >= 0) {
+    gProOK = true;
+  } else {
+    // Slide layer cleared — keep ProPresenter marked OK
+    gProOK = true;
+    idx1 = 0;  // display nothing instead of -1
+  }
+
+  // Update UI: slide index + title
+  enqueueSlide(idx1, name);
+
+  // Update status line text so we aren't stuck on "Booting"
+  if (gProOK) {
+    enqueueStatus("P:T OK");
+  }
+
+  if (idx1 > 0) gTextCleared = false;
+
+  if (idx1 > 0 && uuid.length() > 0) {
+    int thumbIndex = idx1 - 1;
+    if (fetchThumbnailBytes(uuid, thumbIndex, idx1)) {
+      enqueueThumb(idx1);
+    }
+  }
+
+  return true;
+}
+
+// ============================================================
+// STATUS TASK — heartbeat timer
+// ============================================================
+void statusTask(void*) {
+  for (;;) {
+    if (xMutex && xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      millisTime = millis();
+      xSemaphoreGive(xMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(700));
+  }
+}
+static int __debug_marker__ = 123;
+
+// ============================================================
+// HTTP TASK — Core 0 (Data‑Driven API Version)
+// ============================================================
+void httpTask(void*) {
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  TickType_t nextForcedPoll = 0;
+  TickType_t lastBgPoll     = xTaskGetTickCount();
+
+  for (;;) {
+    CmdMsg cmd;
+    bool didWork = false;
+
+    // ---------------------------------------------------------
+    // PROCESS COMMAND QUEUE
+    // ---------------------------------------------------------
+    while (xQueueReceive(cmdQ, &cmd, 0) == pdTRUE) {
+      didWork = true;
+
+      // Look up API definition for this command
+      const ApiCommand* api = findApi(cmd.type);
+
+      // -------------------------------------------------------
+      // DATA‑DRIVEN COMMANDS (NEXT, PREV, HOME, CLEAR, FOCUS)
+      // -------------------------------------------------------
+      if (api) {
+        String url = baseUrl() + api->url;
+
+        enqueueStatus(api->labelOK);
+        gCmdFlashColor = COL_GOOD;
+        gCmdFlashUntil = millis() + 500;
+
+        int code = 0;
+        String body;
+
+        bool ok =
+          ensureWiFi() &&
+          httpGET_once(url, code, body) &&
+          (code == HTTP_CODE_NO_CONTENT || code == HTTP_CODE_OK);
+
+        if (!ok) {
+          enqueueStatus(api->labelERR);
+          gCmdFlashColor = COL_BAD;
+          gCmdFlashUntil = millis() + 500;
+
+          gProOK = false;
+        } else {
+          // Commands that require a follow‑up poll
+          if (cmd.type == CMD_NEXT ||
+              cmd.type == CMD_PREV ||
+              cmd.type == CMD_HOME0) {
+            CmdMsg p{ CMD_POLL };
+            xQueueSend(cmdQ, &p, 0);
+            nextForcedPoll = xTaskGetTickCount() + kAfterTriggerDelay;
+          }
+
+          // Clear slide/text commands update local state
+          if (cmd.type == CMD_CLEAR_SLIDE ||
+              cmd.type == CMD_CLEAR_TEXT) {
+            gTextCleared = true;
+          }
+        }
+      }
+
+      // -------------------------------------------------------
+      // SPECIAL CASE: NET_UP (Wi‑Fi keepalive)
+      // -------------------------------------------------------
+      if (cmd.type == CMD_NET_UP) {
+        ensureWiFi();
+      }
+
+      // -------------------------------------------------------
+      // SPECIAL CASE: POLL (slide index)
+      // -------------------------------------------------------
+      if (cmd.type == CMD_POLL) {
+        if (ensureWiFi()) {
+          String err;
+          if (!pollSlideOnce(err)) {
+            vTaskDelay(kHttpRetryDelayTicks);
+            pollSlideOnce(err);
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------------------------
+    // FORCED POLL AFTER NEXT/PREV/HOME
+    // ---------------------------------------------------------
+    TickType_t now = xTaskGetTickCount();
+    if (nextForcedPoll && now >= nextForcedPoll) {
+      nextForcedPoll = 0;
+      String err;
+      pollSlideOnce(err);
+    }
+
+    // ---------------------------------------------------------
+    // BACKGROUND POLL
+    // ---------------------------------------------------------
+    if (!didWork && (now - lastBgPoll) >= kPollIntervalTicks) {
+    lastBgPoll = now;
+
+    String err;
+    pollSlideOnce(err);                 // slide index
+    pollTransportPresentationCurrent(); // background media
+}
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ============================================================
+// UI TASK — Core 1 (Final, Flicker‑Free, Optimized)
+// ============================================================
+void uiTask(void*) {
+  if (DEBUG) Serial.println("UI TASK STARTED");
+
+  // Wait for Wi‑Fi + network info page to clear
+  while (!gWifiOK || !gNetworkInfoDismissed)
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+  // Wait for layout init
+  while (LCD_W == 0 || LCD_H == 0) {
+    if (DEBUG) Serial.println("WAITING FOR LAYOUT INIT");
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  UiMsg m;
+
+  bool titleDirty    = true;
+  bool cardDirty     = true;
+  bool statusDirty   = true;
+  bool slideNumDirty = true;
+
+  long     lastRssi       = WiFi.RSSI();
+  String   lastStatusText = gStatusText;
+  int      lastSlideIndex = -1;
+
+  bool     heartbeatOn    = false;
+  uint32_t lastHB         = 0;
+
+  for (;;) {
+
+    // ---------------------------------------------------------
+    // PROCESS UI QUEUE MESSAGES
+    // ---------------------------------------------------------
+    while (xQueueReceive(uiQ, &m, 0) == pdTRUE) {
+
+      switch (m.type) {
+
+        case UI_STATUS:
+        case UI_WIFI:
+          gStatusText = m.text;
+          statusDirty = true;
+          break;
+
+        case UI_SLIDE:
+          gSlideIndex = m.slideIndexOneBased;
+
+          // Mark slide number bar dirty
+          slideNumDirty = true;
+          lastSlideIndex = gSlideIndex;
+
+          // Update marquee
+          gMarq.text = m.presName;
+          sprTitle.setTextFont(2);
+          gMarq.w        = sprTitle.textWidth(gMarq.text);
+          gMarq.needed   = (gMarq.w > (LCD_W - 2 * PAD));
+          gMarq.inPause  = false;
+          gMarq.lastTick = millis();
+
+          titleDirty = true;
+          cardDirty  = true;
+          break;
+
+        case UI_THUMB:
+          vTaskDelay(pdMS_TO_TICKS(50));
+          cardDirty = true;
+          break;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // STATUS BAR CHANGE DETECTORS
+    // ---------------------------------------------------------
+    
+    uint32_t now = millis();
+
+    // Only update RSSI every 1 second
+    static uint32_t lastRssiUpdate = 0;
+    if (now - lastRssiUpdate > 1000) {
+        lastRssiUpdate = now;
+
+        long rssi = WiFi.RSSI();
+        if (abs(rssi - lastRssi) > 8) {   // require a big change
+            lastRssi = rssi;
+            statusDirty = true;
+        }
+    } 
+
+    // FIX: Only redraw slide number when index actually changes
+    if (gSlideIndex != lastSlideIndex) {
+        lastSlideIndex = gSlideIndex;
+        slideNumDirty = true;
+    }
+
+    // Heartbeat toggle
+    if (now - lastHB >= 500) {
+        lastHB = now;
+        heartbeatOn = !heartbeatOn;
+        statusDirty = true;
+    }
+
+    if (gStatusText != lastStatusText) {
+      lastStatusText = gStatusText;
+      statusDirty = true;
+    }
+    // BG state changed?
+    static bool lastBgActive = false;
+    if (gBgActive != lastBgActive) {
+        statusDirty = true;
+        lastBgActive = gBgActive;
+    }
+
+    // ---------------------------------------------------------
+    // TITLE / MARQUEE DRAW (TOP, SPRITE)
+    // ---------------------------------------------------------
+    if (titleDirty || gMarq.needed) {
+      drawTitleMarqueeTick(COL_BG, COL_TEXT);
+      sprTitle.pushSprite(0, TITLE_Y);
+      titleDirty = false;
+    }
+
+    // ---------------------------------------------------------
+    // CARD / THUMBNAIL DRAW (MIDDLE, SPRITE)
+    // ---------------------------------------------------------
+    if (cardDirty) {
+      sprCard.fillSprite(COL_BG);
+
+      if (gSlideIndex > 0 && !gThumbBuf.empty()) {
+        if (gThumbMutex) xSemaphoreTake(gThumbMutex, portMAX_DELAY);
+
+        int maxW = sprCard.width();
+        int maxH = sprCard.height();
+
+    // ---------------------------------------------------------
+    // LANDSCAPE‑SPECIFIC SCALING + SHIFT
+    // ---------------------------------------------------------
+    float targetW = maxW;
+    float targetH = maxH * 0.90f;   // portrait default
+
+    int xShift  = 0;                // portrait default
+    int yOffset = (maxH - targetH) / 2;
+    if (yOffset < 0) yOffset = 0;
+
+    if (selectedOrientation == 1) {
+        // LANDSCAPE MODE
+        targetW = maxW * 1.10f;     // slightly wider
+        targetH = maxH * 0.92f;     // slightly shorter (prevents clipping)
+
+        if (targetW > maxW) targetW = maxW;
+        if (targetH > CARD_H) targetH = CARD_H;
+
+        xShift  = -36;              // shift left for balance
+        yOffset = (maxH - targetH) / 2;
+        if (yOffset < 0) yOffset = 0;
+    }
+
+    // ---------------------------------------------------------
+    // TEMP SPRITE FOR AUTO‑CENTERING
+    // ---------------------------------------------------------
+    int tW = (int)targetW;
+    int tH = (int)targetH;
+
+    M5Canvas temp(&M5.Display);
+    temp.setColorDepth(16);
+    temp.createSprite(tW, tH);
+    temp.fillSprite(COL_BG);
+
+    temp.drawJpg(
+      gThumbBuf.data(),
+      gThumbBuf.size(),
+      0, 0,
+      tW,
+    tH
+  );
+
+        int left = maxW, right = 0;
+        for (int x = 0; x < maxW; x++) {
+          for (int y = 0; y < targetH; y++) {
+            if (temp.readPixel(x, y) != COL_BG) {
+              if (x < left) left = x;
+              if (x > right) right = x;
+            }
+          }
+        }
+
+        int scaledW = right - left + 1;
+        int xOffset = (maxW - scaledW) / 2;
+        if (xOffset < 0) xOffset = 0;
+
+        sprCard.drawJpg(
+          gThumbBuf.data(),
+          gThumbBuf.size(),
+          xOffset,
+          yOffset,
+          maxW,
+          targetH
+        );
+
+        temp.deleteSprite();
+        if (gThumbMutex) xSemaphoreGive(gThumbMutex);
+      }
+
+      sprCard.pushSprite(PAD, CARD_Y);
+      cardDirty = false;
+    }
+
+    // ---------------------------------------------------------
+    // STATUS BAR (BOTTOM, DIRECT)
+    // ---------------------------------------------------------
+    if (statusDirty) {
+      drawStatusBar(heartbeatOn);
+      statusDirty = false;
+    }
+
+    // ---------------------------------------------------------
+    // SLIDE NUMBER BAR (ABOVE STATUS BAR, ONLY WHEN DIRTY)
+    // ---------------------------------------------------------
+    if (slideNumDirty) {
+      drawSlideNumberBar();
+      slideNumDirty = false;
+    }
+
+    // ---------------------------------------------------------
+    // Command flash timeout → force redraw to clear border
+    // ---------------------------------------------------------
+    static bool flashWasActive = false;
+    bool flashActive = (millis() < gCmdFlashUntil);
+
+    if (flashActive != flashWasActive) {
+        slideNumDirty = true;   // force redraw when flash starts or ends
+        flashWasActive = flashActive;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+// ============================================================
+// NETWORK INFO PAGE
+// ============================================================
+void showNetworkInfoPage() {
+  gNetworkInfoDismissed = false;
+
+  M5.Lcd.fillScreen(COL_BG);
+  M5.Lcd.setTextFont(2);
+  M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+
+  uint32_t start = millis();
+
+  while (WiFi.localIP().toString() == "0.0.0.0" &&
+         millis() - start < 3000) {
+    delay(100);
+  }
+
+  String ip   = WiFi.localIP().toString();
+  String mac  = WiFi.macAddress();
+  String prof = profiles[selectedProfile].name;
+
+  int scrW = M5.Lcd.width();
+  int scrH = M5.Lcd.height();
+
+  // ============================================================
+  // PORTRAIT MODE
+  // ============================================================
+  if (selectedOrientation == 0) {
+    int LINE = 30;
+    int y = 30;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.println("Network Info");
+    y += LINE;
+
+    M5.Lcd.drawLine(10, y, scrW - 10, y, COL_MUTED);
+    y += LINE;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.printf("Profile: %s", prof.c_str());
+    y += LINE;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.printf("Device IP: %s", ip.c_str());
+    y += LINE;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.printf("MAC: %s", mac.c_str());
+    y += LINE + 10;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.println("Press BtnA or");
+    y += LINE;
+
+    M5.Lcd.setCursor(10, y);
+    M5.Lcd.println("joystick to continue");
+
+    //static bool hbOn = false;
+    //static uint32_t lastHB = 0;
+
+    int heartX = scrW - 22;
+    int heartY = 22;
+
+    auto drawHeartPortrait = [&](bool on) {
+      uint16_t c = on ? TFT_RED : 0xA000;   // bright red vs dim red
+      M5.Lcd.fillCircle(heartX,     heartY,     4, c);
+      M5.Lcd.fillCircle(heartX + 6, heartY,     4, c);
+      M5.Lcd.fillTriangle(
+        heartX - 4, heartY + 2,
+        heartX + 10, heartY + 2,
+        heartX + 3,  heartY + 12,
+        c
+      );
+    };
+
+    drawHeartPortrait(false);
+
+    while (true) {
+      M5.update();
+      JoyState js = readJoystickMiniJoyC();
+
+      if (millis() - start > 6000) {
+        gNetworkInfoDismissed = true;
+        gOnInfoPage = false;
+        M5.Lcd.fillScreen(COL_BG);
+        return;
+      }
+
+      if (M5.BtnA.wasPressed() || js.btn == 1) {
+        gNetworkInfoDismissed = true;
+        gOnInfoPage = false;
+        M5.Lcd.fillScreen(COL_BG);
+        return;
+      }
+
+      delay(20);
+    }
+  }
+
+  // ============================================================
+  // LANDSCAPE MODE (scrolling)
+  // ============================================================
+  int LINE = 22;
+
+  M5Canvas infoSpr(&M5.Display);
+  infoSpr.setColorDepth(8);
+  infoSpr.createSprite(scrW, 220);
+  infoSpr.fillSprite(COL_BG);
+  infoSpr.setTextColor(COL_TEXT, COL_BG);
+  infoSpr.setTextFont(2);
+
+  int y = 10;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.println("Network Info");
+  y += LINE;
+
+  infoSpr.drawLine(10, y, scrW - 10, y, COL_MUTED);
+  y += LINE;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.printf("Profile: %s", prof.c_str());
+  y += LINE;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.printf("Device IP: %s", ip.c_str());
+  y += LINE;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.printf("MAC: %s", mac.c_str());
+  y += LINE + 10;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.println("Press BtnA or");
+  y += LINE;
+
+  infoSpr.setCursor(10, y);
+  infoSpr.println("joystick to continue");
+
+  int contentH = y + LINE;
+  int scrollY = 0;
+  int maxScroll = contentH - scrH;
+  if (maxScroll < 0) maxScroll = 0;
+
+  //static bool hbOn = false;
+  //static uint32_t lastHB = 0;
+
+  int heartX = scrW - 22;
+  int heartY = 12;
+
+  // FIX the landscape heart lambda properly:
+  auto drawHeartLandscapeFixed = [&](bool on) {
+    uint16_t c = on ? TFT_RED : COL_MUTED;
+    M5.Lcd.fillCircle(heartX,     heartY,     4, c);
+    M5.Lcd.fillCircle(heartX + 6, heartY,     4, c);
+    M5.Lcd.fillTriangle(
+      heartX - 4, heartY + 2,
+      heartX + 10, heartY + 2,
+      heartX + 3,  heartY + 12,
+      c
+    );
+  };
+
+  drawHeartLandscapeFixed(false);
+
+  while (true) {
+    M5.update();
+    JoyState js = readJoystickMiniJoyC();
+
+    // AUTO-DISMISS AFTER 5 SECONDS
+    if (millis() - start > 5000) {
+      gNetworkInfoDismissed = true;
+      gOnInfoPage = false;
+      if (DEBUG) Serial.println("INFO PAGE AUTO-DISMISS");
+      M5.Lcd.fillScreen(COL_BG);
+      return;
+    }
+
+    // Scroll
+    int jy = js.y - 128;
+    if (jy < -15) scrollY -= 4;
+    if (jy > 15)  scrollY += 4;
+
+    if (scrollY < 0) scrollY = 0;
+    if (scrollY > maxScroll) scrollY = maxScroll;
+
+    infoSpr.pushSprite(0, -scrollY);
+
+    // Button or joystick BUTTON dismiss (ignore directions)
+if (M5.BtnA.wasPressed() || js.btn == 1) {
+  gNetworkInfoDismissed = true;
+  gOnInfoPage = false;
+  if (DEBUG) Serial.println("INFO PAGE DISMISSED");
+  M5.Lcd.fillScreen(COL_BG);
+  return;
+}
+    delay(20);
+  }
+}
+
+// ============================================================
+// SECTION 5B OF 6
+// SETUP + LOOP
+// ============================================================
+void setup() {
+  if (DEBUG) Serial.begin(115200);
+  if (DEBUG) Serial.println("SETUP VERSION: 2025-12-29-FULL");
+
+  if (DEBUG) Serial.println("A: BEFORE M5.begin()");
+  M5.begin();  // correct for your version
+  if (DEBUG) Serial.println("B: AFTER M5.begin()");
+
+  M5.Lcd.fillScreen(COL_BG);
+
+  // External I2C for MiniJoyC
+  if (DEBUG) Serial.println("C: BEFORE Wire.begin()");
+  Wire.begin(0, 26);
+  Wire.setClock(400000);
+  if (DEBUG) Serial.println("D: AFTER Wire.begin()");
+
+  // I2C scan
+  if (DEBUG) Serial.println("E: BEFORE I2C scan");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      if (DEBUG) Serial.print("Found I2C device at 0x");
+      if (DEBUG) Serial.println(addr, HEX);
+    }
+  }
+  if (DEBUG) Serial.println("F: AFTER I2C scan");
+
+  // MiniJoyC init
+  if (DEBUG) Serial.println("G: BEFORE joyc.begin()");
+  joyc.begin(&Wire, JoyC_ADDR, 0, 26, 400000);
+  if (DEBUG) Serial.println("H: AFTER joyc.begin()");
+
+  // Warm up MiniJoyC
+  if (DEBUG) Serial.println("I: BEFORE warmup");
+  for (int i = 0; i < 10; i++) {
+    joyc.getButtonStatus();
+    delay(10);
+  }
+  if (DEBUG) Serial.println("J: AFTER warmup");
+
+  // Orientation selection
+  if (DEBUG) Serial.println("K: BEFORE runOrientationMenu()");
+  runOrientationMenu();
+  if (DEBUG) Serial.println("L: AFTER runOrientationMenu()");
+  M5.Lcd.setRotation(selectedOrientation == 0 ? 0 : 1);
+  delay(50);
+
+  // Profile selection + network info page
+  if (DEBUG) Serial.println("M: BEFORE runStartupMenu()");
+  runStartupMenu();
+  if (DEBUG) Serial.println("N: AFTER runStartupMenu()");
+
+  M5.Display.init();
+  delay(50);
+
+  M5.Lcd.setRotation(selectedOrientation == 0 ? 0 : 1);
+  delay(50);
+
+  // Layout
+  if (DEBUG) Serial.println("O: BEFORE initLayoutAndSprites()");
+  initLayoutAndSprites();
+  if (DEBUG) Serial.println("P: AFTER initLayoutAndSprites()");
+  M5.Lcd.fillScreen(COL_BG);
+
+  // Queues
+  if (DEBUG) Serial.println("Q: BEFORE queues");
+  cmdQ = xQueueCreate(16, sizeof(CmdMsg));
+  uiQ  = xQueueCreate(16, sizeof(UiMsg));
+  
+  xMutex      = xSemaphoreCreateMutex();
+  gThumbMutex = xSemaphoreCreateMutex();
+  if (DEBUG) Serial.println("R: AFTER queues");
+
+  WiFi.setSleep(false);
+
+  // Tasks
+  if (DEBUG) Serial.println("S: BEFORE task create");
+  xTaskCreatePinnedToCore(uiTask,    "uiTask",    8192, nullptr, 4, nullptr, 1);
+  xTaskCreatePinnedToCore(httpTask,  "httpTask",  6144, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(statusTask,"statusTask",2048, nullptr, 1, nullptr, 1);
+  if (DEBUG) Serial.println("T: AFTER task create");
+
+  enqueueWifi("Booting");
+
+  CmdMsg c{ CMD_POLL };
+  xQueueSend(cmdQ, &c, 0);
+  if (DEBUG) Serial.println("U: END OF setup()");
+}
+// ============================================================
+// LOOP — Final Joystick + Buttons + LED + Command Mapping
+// ============================================================
+
+// Data-driven mapping from joystick direction string -> command
+struct JoyMap {
+  const char* dir;
+  CmdType cmd;
+};
+
+// Portrait: UP/DOWN = next/prev slide, LEFT/RIGHT = focus prev/next
+static const JoyMap kPortraitJoyMap[] = {
+  { "UP",    CMD_NEXT },
+  { "DOWN",  CMD_PREV },
+  { "LEFT",  CMD_PREV_FOCUS },
+  { "RIGHT", CMD_NEXT_FOCUS },
+};
+
+// Landscape: RIGHT/LEFT = next/prev slide, UP/DOWN = focus prev/next
+static const JoyMap kLandscapeJoyMap[] = {
+  { "RIGHT", CMD_NEXT },
+  { "LEFT",  CMD_PREV },
+  { "UP",    CMD_PREV_FOCUS },
+  { "DOWN",  CMD_NEXT_FOCUS },
+};
+
+void loop() {
+  M5.update();
+
+  // ---------------------------------------------------------
+  // BUTTON HANDLING
+  // ---------------------------------------------------------
+  // BUTTON A → NEXT SLIDE
+  if (M5.BtnA.wasPressed()) {
+      CmdMsg c{ CMD_NEXT };
+      xQueueSend(cmdQ, &c, 0);
+  }
+
+  if (M5.BtnB.wasPressed()) {
+    CmdMsg c{ CMD_CLEAR_ALL };
+    xQueueSend(cmdQ, &c, 0);
+  }
+
+  if (M5.BtnPWR.wasPressed()) {
+    CmdMsg c{ CMD_HOME0 };
+    xQueueSend(cmdQ, &c, 0);
+  }
+
+  // ---------------------------------------------------------
+  // JOYSTICK READ
+  // ---------------------------------------------------------
+  JoyState js = readJoystickMiniJoyC();
+
+  // Direction string
+  String dir;
+
+  // With your current rotation + fixes:
+  // js.x = vertical (UP/DOWN), js.y = horizontal (LEFT/RIGHT)
+  int vert  = js.x;       // up/down
+  int horiz = js.y;       // left/right
+
+  static String lastDir = "";
+
+  // ---------------------------------------------------------
+// DIRECTION DETECTION (drift‑proof)
+// ---------------------------------------------------------
+
+const int DEADZONE = 12;        // ignore tiny drift
+const int STRONG   = 25;        // strong push threshold
+
+// Default
+dir = "CENTER";
+
+// Strong horizontal movement → LEFT/RIGHT wins
+if (abs(horiz) > STRONG && abs(horiz) > abs(vert)) {
+    dir = (horiz > 0) ? "LEFT" : "RIGHT";
+}
+// Strong vertical movement → UP/DOWN wins
+else if (abs(vert) > STRONG && abs(vert) > abs(horiz)) {
+    dir = (vert > 0) ? "UP" : "DOWN";
+}
+// Weak movement → treat as CENTER
+else if (abs(vert) < DEADZONE && abs(horiz) < DEADZONE) {
+    dir = "CENTER";
+}
+
+  // ---------------------------------------------------------
+  // LED FEEDBACK (correct for your UNIT_JOYC library)
+  // ---------------------------------------------------------
+  if (dir == "UP") {
+    joyc.setLEDColor(0, 0x00FF00);      // Green
+  }
+  else if (dir == "DOWN") {
+    joyc.setLEDColor(0, 0xFF0000);      // Red
+  }
+  else if (dir == "LEFT") {
+    joyc.setLEDColor(0, 0x0000FF);      // Blue
+  }
+  else if (dir == "RIGHT") {
+    joyc.setLEDColor(0, 0xFFFF00);      // Yellow
+  }
+  else {
+    joyc.setLEDColor(0, 0x000000);      // Off
+  }
+
+  // ---------------------------------------------------------
+  // COMMAND MAPPING (Portrait vs Landscape, data-driven)
+  // ---------------------------------------------------------
+  static bool joyLatched = false;       // prevents repeat firing
+  static uint32_t lastJoyTime = 0;
+  const uint32_t JOY_COOLDOWN = 220;    // ms
+
+  uint32_t now = millis();
+
+  // Reset latch when centered
+  if (dir == "CENTER") {
+    joyLatched = false;
+  }
+
+  // Only fire if not latched and cooldown passed
+  if (!joyLatched && (now - lastJoyTime > JOY_COOLDOWN)) {
+    const JoyMap* map = nullptr;
+    int mapSize = 0;
+
+    if (selectedOrientation == 0) {
+      // PORTRAIT
+      map = kPortraitJoyMap;
+      mapSize = sizeof(kPortraitJoyMap) / sizeof(kPortraitJoyMap[0]);
+    } else {
+      // LANDSCAPE
+      map = kLandscapeJoyMap;
+      mapSize = sizeof(kLandscapeJoyMap) / sizeof(kLandscapeJoyMap[0]);
+    }
+
+    if (map) {
+      for (int i = 0; i < mapSize; ++i) {
+        if (dir == map[i].dir) {
+          CmdMsg c{ map[i].cmd };
+          xQueueSend(cmdQ, &c, 0);
+          joyLatched = true;
+          break;
+        }
+      }
+    }
+
+    lastJoyTime = now;
+  }
+
+  // ---------------------------------------------------------
+  // JOYSTICK BUTTON = CLEAR SLIDE
+  // ---------------------------------------------------------
+  static bool joyBtn = false;
+
+  if (js.btn == 1 && !joyBtn) {
+    joyBtn = true;
+    CmdMsg c{ CMD_CLEAR_SLIDE };
+    xQueueSend(cmdQ, &c, 0);
+  }
+  if (js.btn != 1) joyBtn = false;
+
+  // ---------------------------------------------------------
+  // WIFI KEEPALIVE
+  // ---------------------------------------------------------
+  static uint32_t lastKick = 0;
+  if (now - lastKick > 3000) {
+    lastKick = now;
+    if (!gWifiOK || WiFi.status() != WL_CONNECTED) {
+      CmdMsg c{ CMD_NET_UP };
+      xQueueSend(cmdQ, &c, 0);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // LOOP DELAY
+  // ---------------------------------------------------------
+  vTaskDelay(pdMS_TO_TICKS(10));
+}
